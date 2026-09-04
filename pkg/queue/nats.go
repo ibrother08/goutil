@@ -9,20 +9,15 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 )
 
-type NatsQueue struct {
+type natsQueue struct {
+	cfg        *options
 	conn       *nats.Conn
 	jetStream  jetstream.JetStream
 	stream     jetstream.Stream
 	consumeCtx jetstream.ConsumeContext
 }
 
-type NatsConfig struct {
-	Url    string
-	Name   string
-	MaxAge time.Duration
-}
-
-func NewNatsQueue(cfg *NatsConfig) (*NatsQueue, error) {
+func newNatsQueue(cfg *options) (*natsQueue, error) {
 	conn, err := nats.Connect(cfg.Url)
 	if err != nil {
 		return nil, err
@@ -46,26 +41,48 @@ func NewNatsQueue(cfg *NatsConfig) (*NatsQueue, error) {
 		return nil, err
 	}
 
-	return &NatsQueue{
+	return &natsQueue{
+		cfg:       cfg,
 		conn:      conn,
 		jetStream: jetStream,
 		stream:    stream,
 	}, nil
 }
 
-func (q *NatsQueue) Publish(ctx context.Context, subject string, msg []byte) error {
-	name := q.stream.CachedInfo().Config.Name
+func (q *natsQueue) Publish(ctx context.Context, subject string, msg []byte) error {
+	name := q.cfg.Name
 
-	_, err := q.jetStream.Publish(ctx, fmt.Sprintf("%s.%s", name, subject), msg)
+	_, err := q.jetStream.Publish(ctx, name+"."+subject, msg)
+
 	return err
 }
 
-func (q *NatsQueue) Subscribe(ctx context.Context, subject string, handler MessageHandler) error {
-	name := q.stream.CachedInfo().Config.Name
+func (q *natsQueue) Subscribe(ctx context.Context, subject string, handler MessageHandler, opts ...SubscribeOpt) error {
+	defaultOpts := defaultSubscribeOpts()
+
+	for _, opt := range opts {
+		opt(defaultOpts)
+	}
+
+	name := q.cfg.Name
+
+	var durable, filterSubject string
+
+	if subject == "" {
+		durable = name
+		filterSubject = name + ".>"
+	} else {
+		durable = name + "-" + subject
+		filterSubject = name + "." + subject
+	}
+
+	if !defaultOpts.Durable {
+		durable = ""
+	}
 
 	consumer, err := q.stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
-		Durable:       fmt.Sprintf("%s-%s", name, subject),
-		FilterSubject: fmt.Sprintf("%s.%s", name, subject),
+		Durable:       durable,
+		FilterSubject: filterSubject,
 		AckPolicy:     jetstream.AckExplicitPolicy,
 	})
 	if err != nil {
@@ -74,7 +91,6 @@ func (q *NatsQueue) Subscribe(ctx context.Context, subject string, handler Messa
 
 	consumeCtx, err := consumer.Consume(func(msg jetstream.Msg) {
 		if err := handler(msg.Data()); err != nil {
-			msg.Nak()
 			return
 		}
 
@@ -88,12 +104,18 @@ func (q *NatsQueue) Subscribe(ctx context.Context, subject string, handler Messa
 	return nil
 }
 
-func (q *NatsQueue) Close() error {
-	q.consumeCtx.Stop()
+func (q *natsQueue) Close() error {
+	if q.consumeCtx != nil {
+		q.consumeCtx.Stop()
+	}
 
 	if err := q.conn.Drain(); err != nil {
 		return err
 	}
 
 	return nil
+}
+
+func (q *natsQueue) Purge(ctx context.Context) error {
+	return q.stream.Purge(ctx)
 }
